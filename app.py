@@ -574,33 +574,38 @@ if role == "Admin" and st.session_state.is_admin:
                 col1, col2 = st.columns(2)
 
                 with col1:
-                    name = st.text_input("Client ka Naam *")
-                    phone = st.text_input("Client ka Number *")
-                    country = st.text_input("Country", value="Pakistan")
+                    name = st.text_input("Client ka Naam *", key="lead_client_name")
+                    phone = st.text_input("Client ka Number *", key="lead_client_phone")
+                    country = st.text_input("Country", value="Pakistan", key="lead_country")
                     lead_source = st.text_input(
                         "Lead Source",
                         value="Referral",
+                        key="lead_source",
                     )
 
                 with col2:
                     month = st.text_input(
                         "Month",
                         value=dt.date.today().strftime("%B %Y"),
+                        key="lead_month",
                     )
                     status = st.selectbox(
                         "Status",
                         STATUS_OPTIONS,
+                        key="add_referral_status",
                     )
                     priority = st.selectbox(
                         "Priority",
                         PRIORITY_OPTIONS,
                         index=1,
+                        key="add_lead_priority",
                     )
 
                 notes = st.text_area(
                     "Notes",
                     placeholder="Client details, budget, timeline etc.",
                     height=120,
+                    key="lead_notes",
                 )
 
                 submitted = st.form_submit_button(
@@ -635,25 +640,29 @@ if role == "Admin" and st.session_state.is_admin:
                 col1, col2 = st.columns(2)
 
                 with col1:
-                    client_name = st.text_input("Client ka Naam *")
-                    phone = st.text_input("Client ka Number *")
+                    client_name = st.text_input("Client ka Naam *", key="lead_client_name")
+                    phone = st.text_input("Client ka Number *", key="lead_client_phone")
                     referred_to = st.selectbox(
                         "Kisko Refer Kar Rahe Hain *",
                         TEAM_MEMBERS,
+                        key="add_referral_member",
                     )
 
                 with col2:
                     referred_date = st.date_input(
                         "Refer Karne ki Date *",
                         value=dt.date.today(),
+                        key="ref_date",
                     )
                     status = st.selectbox(
                         "Status",
                         STATUS_OPTIONS,
+                        key="add_referral_status",
                     )
 
                 requirement = st.text_area(
                     "Client ki Requirement / Detail *",
+                    key="ref_requirement",
                     placeholder=(
                         "Client ko kya chahiye, budget, timeline, "
                         "koi khaas baat etc."
@@ -664,6 +673,7 @@ if role == "Admin" and st.session_state.is_admin:
                 notes = st.text_area(
                     "Extra Notes / Update",
                     height=90,
+                    key="ref_notes",
                 )
 
                 submitted = st.form_submit_button(
@@ -701,7 +711,7 @@ if role == "Admin" and st.session_state.is_admin:
     with tab2:
         st.subheader("All Leads — Data Sheet")
 
-        if st.button("🔄 Refresh Leads"):
+        if st.button("🔄 Refresh Leads", key="refresh_leads"):
             st.rerun()
 
         df = get_all_leads()
@@ -710,72 +720,81 @@ if role == "Admin" and st.session_state.is_admin:
             st.info("Data sheet mein abhi koi lead nahi mili.")
         else:
             # Filters
+            # Blank cells in the existing Data sheet are treated as "Not Set"
+            # so they do not accidentally hide otherwise valid leads.
             f1, f2, f3, f4 = st.columns(4)
 
-            with f1:
-                statuses = sorted(
-                    [x for x in df["Status"].unique() if str(x).strip()]
+            filter_df = df.copy()
+            for _col in ["Status", "Priority", "Country"]:
+                filter_df[_col] = (
+                    filter_df[_col]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                    .replace("", "Not Set")
                 )
+
+            with f1:
+                statuses = sorted(filter_df["Status"].unique().tolist())
                 selected_status = st.multiselect(
                     "Status",
                     statuses,
                     default=statuses,
+                    key="all_leads_status_filter",
                 )
 
             with f2:
-                priorities = sorted(
-                    [x for x in df["Priority"].unique() if str(x).strip()]
-                )
-                if not priorities:
-                    priorities = PRIORITY_OPTIONS
+                priorities = sorted(filter_df["Priority"].unique().tolist())
                 selected_priority = st.multiselect(
                     "Priority",
                     priorities,
                     default=priorities,
+                    key="all_leads_priority_filter",
                 )
 
             with f3:
-                countries = sorted(
-                    [x for x in df["Country"].unique() if str(x).strip()]
-                )
+                countries = sorted(filter_df["Country"].unique().tolist())
                 selected_country = st.multiselect(
                     "Country",
                     countries,
                     default=countries,
+                    key="all_leads_country_filter",
                 )
 
             with f4:
                 search = st.text_input(
-                    "🔍 Search Name / Phone / Notes"
+                    "🔍 Search Name / Phone / Notes",
+                    key="all_leads_search",
                 )
 
             filtered = df.copy()
 
+            # Normalize filter values so extra spaces/case differences
+            # in Google Sheets do not hide valid records.
+            filtered["_status_norm"] = filtered["Status"].fillna("").astype(str).str.strip().str.casefold()
+            filtered["_priority_norm"] = filtered["Priority"].fillna("").astype(str).str.strip().str.casefold()
+            filtered["_country_norm"] = filtered["Country"].fillna("").astype(str).str.strip().str.casefold()
+
             if selected_status:
-                filtered = filtered[
-                    filtered["Status"].isin(selected_status)
-                ]
+                wanted = {str(x).strip().casefold() for x in selected_status}
+                filtered = filtered[filtered["_status_norm"].isin(wanted)]
 
             if selected_priority:
-                filtered = filtered[
-                    filtered["Priority"].isin(selected_priority)
-                ]
+                wanted = {str(x).strip().casefold() for x in selected_priority}
+                filtered = filtered[filtered["_priority_norm"].isin(wanted)]
 
             if selected_country:
-                filtered = filtered[
-                    filtered["Country"].isin(selected_country)
-                ]
+                wanted = {str(x).strip().casefold() for x in selected_country}
+                filtered = filtered[filtered["_country_norm"].isin(wanted)]
+
+            # Internal helper columns are never displayed/downloaded.
 
             if search.strip():
                 s = search.strip().lower()
                 mask = (
-                    filtered["Name"].str.lower().str.contains(s, na=False)
-                    | filtered["Phone Number"]
-                    .str.lower()
-                    .str.contains(s, na=False)
-                    | filtered["Notes"]
-                    .str.lower()
-                    .str.contains(s, na=False)
+                    filtered["Name"].fillna("").astype(str).str.lower().str.contains(s, na=False)
+                    | filtered["Phone Number"].fillna("").astype(str).str.lower().str.contains(s, na=False)
+                    | filtered["Notes"].fillna("").astype(str).str.lower().str.contains(s, na=False)
                 )
                 filtered = filtered[mask]
 
@@ -825,6 +844,7 @@ if role == "Admin" and st.session_state.is_admin:
                         f"ID {filtered.loc[filtered['row_number'] == x, 'ID'].iloc[0]} — "
                         f"{filtered.loc[filtered['row_number'] == x, 'Name'].iloc[0]}"
                     ),
+                    key="lead_update_select",
                 )
 
                 row = filtered[
@@ -842,6 +862,7 @@ if role == "Admin" and st.session_state.is_admin:
                             if row["Status"] in STATUS_OPTIONS
                             else 0
                         ),
+                        key="lead_update_status",
                     )
 
                     new_priority = st.selectbox(
@@ -852,12 +873,14 @@ if role == "Admin" and st.session_state.is_admin:
                             if row["Priority"] in PRIORITY_OPTIONS
                             else 1
                         ),
+                        key="lead_update_priority",
                     )
 
                 with u2:
                     new_notes = st.text_area(
                         "Notes Update Karein",
                         value=row["Notes"],
+                        key="lead_update_notes",
                     )
 
                 b1, b2 = st.columns(2)
@@ -899,7 +922,7 @@ if role == "Admin" and st.session_state.is_admin:
     with tab3:
         st.subheader("Team Sheet / All Referrals")
 
-        if st.button("🔄 Refresh Referrals"):
+        if st.button("🔄 Refresh Referrals", key="refresh_referrals"):
             st.rerun()
 
         rdf = get_all_referrals()
@@ -923,6 +946,7 @@ if role == "Admin" and st.session_state.is_admin:
                     "Team Member",
                     members,
                     default=members,
+                    key="referrals_member_filter",
                 )
 
             with r2:
@@ -937,11 +961,13 @@ if role == "Admin" and st.session_state.is_admin:
                     "Status",
                     referral_statuses,
                     default=referral_statuses,
+                    key="referrals_status_filter",
                 )
 
             with r3:
                 search_ref = st.text_input(
-                    "🔍 Search Client / Number"
+                    "🔍 Search Client / Number",
+                    key="referrals_search",
                 )
 
             with r4:
@@ -1009,6 +1035,7 @@ if role == "Admin" and st.session_state.is_admin:
                         f"Ref #{filtered_r.loc[filtered_r['row_number'] == x, 'Ref #'].iloc[0]} — "
                         f"{filtered_r.loc[filtered_r['row_number'] == x, 'Client Name'].iloc[0]}"
                     ),
+                    key="referral_update_select",
                 )
 
                 selected = filtered_r[
@@ -1027,6 +1054,7 @@ if role == "Admin" and st.session_state.is_admin:
                             if current_status in STATUS_OPTIONS
                             else 0
                         ),
+                        key="referral_update_status",
                     )
 
                 with c2:
@@ -1035,6 +1063,7 @@ if role == "Admin" and st.session_state.is_admin:
                         value=selected[
                             "Update / Notes from Member"
                         ],
+                        key="referral_update_notes",
                     )
 
                 d1, d2 = st.columns(2)
@@ -1080,12 +1109,13 @@ elif role == "Admin" and not st.session_state.is_admin:
 else:
     st.title("📋 Team Member - Mere Referrals")
 
-    if st.button("🔄 Refresh"):
+    if st.button("🔄 Refresh", key="refresh_team_member"):
         st.rerun()
 
     selected_member = st.selectbox(
         "Apna Naam Select Karein",
         TEAM_MEMBERS,
+        key="team_member_select",
     )
 
     rdf = get_all_referrals()
@@ -1111,6 +1141,7 @@ else:
                 "Status ke hisaab se dekhein",
                 STATUS_OPTIONS,
                 default=STATUS_OPTIONS,
+                key="team_member_status_filter",
             )
 
             my_referrals = my_referrals[
