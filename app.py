@@ -1,58 +1,37 @@
 """
-NM Associates CRM - Lead Referral & Team Sheet Dashboard (Google Sheets backend)
----------------------------------------------------------------------------------
-Ye version data ko SQLite ki bajaye Google Sheets mein save karta hai, taake:
-  - Data kabhi delete na ho (app restart/redeploy hone par bhi)
-  - Aap khud bhi Google Sheet kholkar data dekh/edit kar sakein
-  - Multiple team members ka data ek hi jagah, hamesha safe rahe
+NM Associates CRM - Google Sheets version
 
-SETUP (ek dafa karna hai):
-  1. Google Cloud Console (console.cloud.google.com) par jayein.
-  2. Naya project banayein (ya purana use karein).
-  3. "Google Sheets API" aur "Google Drive API" dono ko ENABLE karein.
-  4. "APIs & Services" -> "Credentials" -> "Create Credentials" -> "Service Account".
-  5. Service account bana lene ke baad, uski "Keys" tab mein jayein aur
-     "Add Key" -> "Create new key" -> JSON. Ye JSON file download ho jayegi.
-  6. Google Sheets par jayein, ek nayi Google Sheet banayein (naam kuch bhi rakhein,
-     masalan "NM Associates Leads"). Us sheet ko OPEN karein aur "Share" button se
-     us email ko Editor access dein jo JSON file mein "client_email" field mein
-     likha hai (kuch is tarah: xxxx@xxxx.iam.gserviceaccount.com).
-  7. Sheet ke URL se uski ID nikal lein. URL is tarah ki hoti hai:
-     https://docs.google.com/spreadsheets/d/SPREADSHEET_ID_YAHAN_HAI/edit
-  8. Streamlit Cloud app -> Settings -> Secrets mein ye format se daal dein:
-
-     SPREADSHEET_ID = "yahan_apni_sheet_ki_id_dalein"
-     ADMIN_PASSWORD = "apna_password_yahan_dalein"
-
-     [gcp_service_account]
-     type = "service_account"
-     project_id = "..."
-     private_key_id = "..."
-     private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-     client_email = "...iam.gserviceaccount.com"
-     client_id = "..."
-     auth_uri = "https://accounts.google.com/o/oauth2/auth"
-     token_uri = "https://oauth2.googleapis.com/token"
-     auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-     client_x509_cert_url = "..."
-
-     (Ye sab values downloaded JSON file se copy honi hain - JSON file kholkar
-     har field ka value yahan paste kar dein.)
-
-  Bas itna karne ke baad app khud hi sheet mein "Leads" naam ka worksheet
-  bana lega aur data save karna shuru kar dega.
+Features:
+- Reads existing leads from the Google Sheets "Data" worksheet.
+- Existing leads remain intact; no migration/deletion is performed.
+- Adds new leads to the "Data" worksheet.
+- Team referral tracker uses the existing "Team Referrals" worksheet.
+- Admin login via Streamlit Secrets.
+- Filter/search existing leads by status, priority, country, month and source.
+- Filter team referrals by team member/status/date and search client.
+- Update/delete leads and referral records.
+- CSV downloads.
+- Automatically creates missing sheets with safe headers.
 """
 
 import datetime as dt
+from typing import Optional
 
 import gspread
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
 
+
 # ----------------------------------------------------------------------
 # BASIC CONFIG
 # ----------------------------------------------------------------------
+st.set_page_config(
+    page_title="NM Associates CRM",
+    page_icon="📋",
+    layout="wide",
+)
+
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin123")
 
 TEAM_MEMBERS = [
@@ -63,11 +42,39 @@ TEAM_MEMBERS = [
     "Abdul Mannan Bhatti",
 ]
 
-STATUS_OPTIONS = ["New", "Contacted", "In Progress", "Follow-up", "Closed - Won", "Closed - Lost"]
+STATUS_OPTIONS = [
+    "New",
+    "Contacted",
+    "In Progress",
+    "Follow-up",
+    "Closed - Won",
+    "Closed - Lost",
+]
 
-HEADERS = [
-    "client_name", "phone_number", "requirement", "referred_to",
-    "referred_date", "status", "notes", "added_by", "created_at",
+PRIORITY_OPTIONS = ["Low", "Medium", "High", "Urgent"]
+
+DATA_HEADERS = [
+    "ID",
+    "Name",
+    "Phone Number",
+    "Country",
+    "Month",
+    "Lead Source",
+    "Status",
+    "Priority",
+    "Notes",
+]
+
+REFERRAL_HEADERS = [
+    "Ref #",
+    "Date Referred",
+    "Referred To (Team Member)",
+    "Client Name",
+    "Client Phone Number",
+    "Client Requirement / Details",
+    "Status",
+    "Last Update Date",
+    "Update / Notes from Member",
 ]
 
 SCOPES = [
@@ -75,102 +82,449 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-st.set_page_config(page_title="NM Associates CRM", page_icon="📋", layout="wide")
-
 
 # ----------------------------------------------------------------------
 # GOOGLE SHEETS CONNECTION
 # ----------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
-def get_worksheet():
-    if "gcp_service_account" not in st.secrets or "SPREADSHEET_ID" not in st.secrets:
+def get_spreadsheet():
+    if "gcp_service_account" not in st.secrets:
         return None
+    if "SPREADSHEET_ID" not in st.secrets:
+        return None
+
     creds = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]), scopes=SCOPES
+        dict(st.secrets["gcp_service_account"]),
+        scopes=SCOPES,
     )
     client = gspread.authorize(creds)
-    sh = client.open_by_key(st.secrets["SPREADSHEET_ID"])
+    return client.open_by_key(st.secrets["SPREADSHEET_ID"])
+
+
+@st.cache_resource(show_spinner=False)
+def get_data_worksheet():
+    sh = get_spreadsheet()
+    if sh is None:
+        return None
+
     try:
-        ws = sh.worksheet("Leads")
+        ws = sh.worksheet("Data")
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title="Leads", rows=2000, cols=len(HEADERS))
-        ws.append_row(HEADERS)
-    # agar sheet bilkul khali hai to header daal dein
+        ws = sh.add_worksheet(
+            title="Data",
+            rows=2000,
+            cols=len(DATA_HEADERS),
+        )
+        ws.append_row(DATA_HEADERS)
+
+    # If a newly created/empty sheet exists, add headers.
     if not ws.get_all_values():
-        ws.append_row(HEADERS)
+        ws.append_row(DATA_HEADERS)
+
     return ws
 
 
+@st.cache_resource(show_spinner=False)
+def get_referral_worksheet():
+    sh = get_spreadsheet()
+    if sh is None:
+        return None
+
+    try:
+        ws = sh.worksheet("Team Referrals")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(
+            title="Team Referrals",
+            rows=1000,
+            cols=len(REFERRAL_HEADERS),
+        )
+        ws.update("A1:I1", [REFERRAL_HEADERS])
+
+    # For an existing workbook, the real referral table starts at B14.
+    # If the sheet is empty/new, use A1:I1.
+    values = ws.get_all_values()
+    if not values:
+        ws.update("A1:I1", [REFERRAL_HEADERS])
+        return ws
+
+    # Detect the existing template header.
+    header_row = None
+    for idx, row in enumerate(values, start=1):
+        cleaned = [str(x).strip() for x in row]
+        if "Ref #" in cleaned and "Client Name" in cleaned:
+            header_row = idx
+            break
+
+    if header_row is None:
+        # Create a clean table at the top without destroying existing content.
+        # Use the first unused row after existing content.
+        new_row = len(values) + 2
+        ws.update(
+            f"A{new_row}:I{new_row}",
+            [REFERRAL_HEADERS],
+        )
+
+    return ws
+
+
+# ----------------------------------------------------------------------
+# HELPERS
+# ----------------------------------------------------------------------
+def _safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_data_table_location(ws):
+    """Return (header_row, start_col) for the Data worksheet."""
+    return 1, 1
+
+
+def get_referral_table_location(ws):
+    """
+    Return (header_row, start_col) for Team Referrals.
+
+    Existing NM Associates template:
+      headers are B14:J14.
+
+    A newly created table:
+      headers are A1:I1.
+    """
+    values = ws.get_all_values()
+    for idx, row in enumerate(values, start=1):
+        cleaned = [str(x).strip() for x in row]
+        if "Ref #" in cleaned and "Client Name" in cleaned:
+            ref_col = cleaned.index("Ref #") + 1
+            return idx, ref_col
+
+    # If we created A1:I1 above.
+    return 1, 1
+
+
+def ensure_data_headers(ws):
+    current = [str(x).strip() for x in ws.row_values(1)]
+    if not current:
+        ws.update("A1:I1", [DATA_HEADERS])
+        return
+
+    # If the sheet is the expected Data sheet, preserve existing columns.
+    # Missing expected headers are added only at the end.
+    missing = [h for h in DATA_HEADERS if h not in current]
+    if missing:
+        start = len(current) + 1
+        end = start + len(missing) - 1
+        ws.update(
+            f"{gspread.utils.rowcol_to_a1(1, start)}:"
+            f"{gspread.utils.rowcol_to_a1(1, end)}",
+            [missing],
+        )
+
+
+def ensure_referral_headers(ws):
+    header_row, start_col = get_referral_table_location(ws)
+    existing = ws.row_values(header_row)
+
+    # Ensure the table has all required headers starting at its detected column.
+    existing_slice = [
+        str(x).strip()
+        for x in existing[start_col - 1 : start_col - 1 + len(REFERRAL_HEADERS)]
+    ]
+    if existing_slice != REFERRAL_HEADERS:
+        start_a1 = gspread.utils.rowcol_to_a1(header_row, start_col)
+        end_a1 = gspread.utils.rowcol_to_a1(
+            header_row,
+            start_col + len(REFERRAL_HEADERS) - 1,
+        )
+        ws.update(f"{start_a1}:{end_a1}", [REFERRAL_HEADERS])
+
+    return header_row, start_col
+
+
+# ----------------------------------------------------------------------
+# DATA SHEET - EXISTING LEADS
+# ----------------------------------------------------------------------
 def get_all_leads():
-    ws = get_worksheet()
+    ws = get_data_worksheet()
     if ws is None:
-        return pd.DataFrame(columns=HEADERS + ["row_number"])
-    records = ws.get_all_records()
+        return pd.DataFrame(columns=DATA_HEADERS + ["row_number"])
+
+    ensure_data_headers(ws)
+    records = ws.get_all_records(
+        head=1,
+        expected_headers=DATA_HEADERS,
+    )
+
     if not records:
-        return pd.DataFrame(columns=HEADERS + ["row_number"])
+        return pd.DataFrame(columns=DATA_HEADERS + ["row_number"])
+
     df = pd.DataFrame(records)
-    df["row_number"] = range(2, len(df) + 2)  # row 1 = header
-    if "referred_date" in df.columns:
-        df["referred_date"] = pd.to_datetime(df["referred_date"], errors="coerce").dt.date
+
+    # Make sure all expected columns exist.
+    for col in DATA_HEADERS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[DATA_HEADERS].copy()
+    df["row_number"] = range(2, len(df) + 2)
+
+    # Normalize data types for filtering/search.
+    for col in DATA_HEADERS:
+        if col != "ID":
+            df[col] = df[col].fillna("").astype(str)
+
     return df
 
 
-def add_lead(client_name, phone_number, requirement, referred_to, referred_date, status, notes, added_by):
-    ws = get_worksheet()
-    ws.append_row([
-        client_name.strip(),
-        phone_number.strip(),
-        requirement.strip(),
-        referred_to,
-        str(referred_date),
-        status,
-        notes.strip() if notes else "",
-        added_by,
-        dt.datetime.now().isoformat(timespec="seconds"),
-    ])
+def next_lead_id(ws):
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return 1
+
+    id_index = DATA_HEADERS.index("ID")
+    ids = []
+    for row in values[1:]:
+        if len(row) > id_index:
+            try:
+                ids.append(int(float(row[id_index])))
+            except (TypeError, ValueError):
+                pass
+
+    return max(ids, default=0) + 1
 
 
-def update_lead(row_number, status=None, notes=None):
-    ws = get_worksheet()
-    if status is not None:
-        ws.update_cell(row_number, HEADERS.index("status") + 1, status)
-    if notes is not None:
-        ws.update_cell(row_number, HEADERS.index("notes") + 1, notes)
+def add_lead(
+    name,
+    phone,
+    country,
+    month,
+    lead_source,
+    status,
+    priority,
+    notes,
+):
+    ws = get_data_worksheet()
+    if ws is None:
+        raise RuntimeError("Google Sheets connection is not configured.")
+
+    ensure_data_headers(ws)
+    lead_id = next_lead_id(ws)
+
+    ws.append_row(
+        [
+            lead_id,
+            name.strip(),
+            phone.strip(),
+            country.strip(),
+            month.strip(),
+            lead_source.strip(),
+            status,
+            priority,
+            notes.strip() if notes else "",
+        ],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def update_lead(row_number, updates):
+    ws = get_data_worksheet()
+    if ws is None:
+        raise RuntimeError("Google Sheets connection is not configured.")
+
+    ensure_data_headers(ws)
+
+    for column_name, value in updates.items():
+        if column_name not in DATA_HEADERS or column_name == "ID":
+            continue
+        col_number = DATA_HEADERS.index(column_name) + 1
+        ws.update_cell(row_number, col_number, value)
 
 
 def delete_lead(row_number):
-    ws = get_worksheet()
+    ws = get_data_worksheet()
+    if ws is None:
+        raise RuntimeError("Google Sheets connection is not configured.")
     ws.delete_rows(row_number)
 
 
 # ----------------------------------------------------------------------
-# SESSION STATE
+# TEAM REFERRALS SHEET
 # ----------------------------------------------------------------------
-if "is_admin" not in st.session_state:
-    st.session_state.is_admin = False
+def get_all_referrals():
+    ws = get_referral_worksheet()
+    if ws is None:
+        return pd.DataFrame(columns=REFERRAL_HEADERS + ["row_number"])
+
+    header_row, start_col = ensure_referral_headers(ws)
+
+    end_col = start_col + len(REFERRAL_HEADERS) - 1
+    values = ws.get(
+        f"{gspread.utils.rowcol_to_a1(header_row, start_col)}:"
+        f"{gspread.utils.rowcol_to_a1(ws.row_count, end_col)}"
+    )
+
+    if not values:
+        return pd.DataFrame(columns=REFERRAL_HEADERS + ["row_number"])
+
+    data_rows = values[1:]
+    data_rows = [
+        row + [""] * (len(REFERRAL_HEADERS) - len(row))
+        for row in data_rows
+    ]
+    data_rows = [row[: len(REFERRAL_HEADERS)] for row in data_rows]
+
+    # Remove completely empty rows.
+    data_rows = [
+        row
+        for row in data_rows
+        if any(str(cell).strip() for cell in row)
+    ]
+
+    if not data_rows:
+        return pd.DataFrame(columns=REFERRAL_HEADERS + ["row_number"])
+
+    df = pd.DataFrame(data_rows, columns=REFERRAL_HEADERS)
+
+    # Actual Google Sheet row numbers.
+    row_numbers = []
+    for offset, row in enumerate(values[1:], start=1):
+        if any(str(cell).strip() for cell in row):
+            row_numbers.append(header_row + offset)
+
+    df["row_number"] = row_numbers
+
+    for col in REFERRAL_HEADERS:
+        df[col] = df[col].fillna("").astype(str)
+
+    return df
+
+
+def next_referral_number(ws, header_row, start_col):
+    df = get_all_referrals()
+    if df.empty:
+        return 1
+
+    nums = []
+    for value in df["Ref #"]:
+        try:
+            nums.append(int(float(value)))
+        except (TypeError, ValueError):
+            pass
+
+    return max(nums, default=0) + 1
+
+
+def add_referral(
+    date_referred,
+    referred_to,
+    client_name,
+    phone,
+    requirement,
+    status,
+    notes,
+):
+    ws = get_referral_worksheet()
+    if ws is None:
+        raise RuntimeError("Google Sheets connection is not configured.")
+
+    header_row, start_col = ensure_referral_headers(ws)
+    ref_number = next_referral_number(ws, header_row, start_col)
+
+    row = [
+        ref_number,
+        str(date_referred),
+        referred_to,
+        client_name.strip(),
+        phone.strip(),
+        requirement.strip(),
+        status,
+        str(dt.date.today()),
+        notes.strip() if notes else "",
+    ]
+
+    # Find first available row after header.
+    existing = ws.get_all_values()
+    target_row = max(header_row + 1, len(existing) + 1)
+
+    ws.update(
+        f"{gspread.utils.rowcol_to_a1(target_row, start_col)}:"
+        f"{gspread.utils.rowcol_to_a1(target_row, start_col + len(row) - 1)}",
+        [row],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def update_referral(row_number, status=None, notes=None):
+    ws = get_referral_worksheet()
+    if ws is None:
+        raise RuntimeError("Google Sheets connection is not configured.")
+
+    header_row, start_col = ensure_referral_headers(ws)
+    header_to_col = {
+        header: start_col + i
+        for i, header in enumerate(REFERRAL_HEADERS)
+    }
+
+    if status is not None:
+        ws.update_cell(row_number, header_to_col["Status"], status)
+
+    if notes is not None:
+        ws.update_cell(
+            row_number,
+            header_to_col["Update / Notes from Member"],
+            notes,
+        )
+
+    ws.update_cell(
+        row_number,
+        header_to_col["Last Update Date"],
+        str(dt.date.today()),
+    )
+
+
+def delete_referral(row_number):
+    ws = get_referral_worksheet()
+    if ws is None:
+        raise RuntimeError("Google Sheets connection is not configured.")
+    ws.delete_rows(row_number)
+
 
 # ----------------------------------------------------------------------
 # CONNECTION CHECK
 # ----------------------------------------------------------------------
 if "gcp_service_account" not in st.secrets or "SPREADSHEET_ID" not in st.secrets:
     st.error(
-        "⚠️ Google Sheets se connection set nahi hua. Streamlit Cloud app ki "
-        "**Settings → Secrets** mein `SPREADSHEET_ID`, `ADMIN_PASSWORD` aur "
-        "`[gcp_service_account]` details daalein. App ke top comment mein poori "
-        "instructions likhi hain."
+        "⚠️ Google Sheets connection set nahi hai. "
+        "Streamlit Cloud → Settings → Secrets mein "
+        "`SPREADSHEET_ID`, `ADMIN_PASSWORD` aur `[gcp_service_account]` "
+        "details add karein."
     )
     st.stop()
 
+
 # ----------------------------------------------------------------------
-# SIDEBAR - ROLE SELECTION
+# SIDEBAR
 # ----------------------------------------------------------------------
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+
 st.sidebar.title("📋 NM Associates CRM")
-role = st.sidebar.radio("View karna hai?", ["Admin", "Team Member"], index=0)
+
+role = st.sidebar.radio(
+    "View karna hai?",
+    ["Admin", "Team Member"],
+    index=0,
+)
 
 if role == "Admin" and not st.session_state.is_admin:
     st.sidebar.markdown("---")
-    pwd = st.sidebar.text_input("Admin Password", type="password")
-    if st.sidebar.button("Login"):
+    pwd = st.sidebar.text_input(
+        "Admin Password",
+        type="password",
+    )
+
+    if st.sidebar.button("Login", use_container_width=True):
         if pwd == ADMIN_PASSWORD:
             st.session_state.is_admin = True
             st.rerun()
@@ -179,7 +533,7 @@ if role == "Admin" and not st.session_state.is_admin:
 
 if st.session_state.is_admin:
     st.sidebar.success("Admin logged in ✅")
-    if st.sidebar.button("Logout"):
+    if st.sidebar.button("Logout", use_container_width=True):
         st.session_state.is_admin = False
         st.rerun()
 
@@ -187,171 +541,599 @@ st.sidebar.markdown("---")
 st.sidebar.caption("Team Members: " + ", ".join(TEAM_MEMBERS))
 st.sidebar.caption("Data source: Google Sheets 🔗")
 
-# ========================================================================
+
+# ----------------------------------------------------------------------
 # ADMIN PANEL
-# ========================================================================
+# ----------------------------------------------------------------------
 if role == "Admin" and st.session_state.is_admin:
     st.title("Admin Panel")
+    st.caption("Google Sheets powered CRM — existing data is preserved.")
 
-    tab1, tab2 = st.tabs(["➕ Add New Referral", "📊 Team Sheet / All Leads"])
+    tab1, tab2, tab3 = st.tabs(
+        [
+            "➕ Add New Lead / Referral",
+            "📊 All Leads",
+            "👥 Team Referrals",
+        ]
+    )
 
-    # ---------------- TAB 1: ADD NEW REFERRAL ----------------
+    # ------------------------------------------------------------------
+    # TAB 1: ADD
+    # ------------------------------------------------------------------
     with tab1:
-        st.subheader("Naya Lead Refer Karein")
-        with st.form("add_lead_form", clear_on_submit=True):
-            col1, col2 = st.columns(2)
-            with col1:
-                client_name = st.text_input("Client ka Naam *")
-                phone_number = st.text_input("Client ka Number *")
-                referred_to = st.selectbox("Kisko Refer Kar Rahe Hain *", TEAM_MEMBERS)
-            with col2:
-                referred_date = st.date_input("Refer Karne ki Date *", value=dt.date.today())
-                status = st.selectbox("Status", STATUS_OPTIONS, index=0)
-                added_by = st.text_input("Aap ka Naam (Admin/Referrer)", value="Admin")
+        st.subheader("Naya Lead Add / Refer Karein")
 
-            requirement = st.text_area(
-                "Client ki Requirement / Detail *",
-                placeholder="Yahan har detail likhein - client ko kya chahiye, budget, timeline, koi khaas baat etc.",
-                height=150,
-            )
-            notes = st.text_area("Extra Notes (optional)", height=80)
+        mode = st.radio(
+            "Action",
+            ["Add to Leads", "Add Team Referral"],
+            horizontal=True,
+        )
 
-            submitted = st.form_submit_button("✅ Lead Add Karein", use_container_width=True)
-            if submitted:
-                if not client_name or not phone_number or not requirement:
-                    st.error("Client Name, Phone Number aur Requirement zaroori hain.")
-                else:
-                    add_lead(
-                        client_name, phone_number, requirement, referred_to,
-                        referred_date, status, notes, added_by,
+        if mode == "Add to Leads":
+            with st.form("add_lead_form", clear_on_submit=True):
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    name = st.text_input("Client ka Naam *")
+                    phone = st.text_input("Client ka Number *")
+                    country = st.text_input("Country", value="Pakistan")
+                    lead_source = st.text_input(
+                        "Lead Source",
+                        value="Referral",
                     )
-                    st.success(f"Lead '{client_name}' successfully {referred_to} ko refer ho gayi ✅")
 
-    # ---------------- TAB 2: TEAM SHEET / ALL LEADS ----------------
+                with col2:
+                    month = st.text_input(
+                        "Month",
+                        value=dt.date.today().strftime("%B %Y"),
+                    )
+                    status = st.selectbox(
+                        "Status",
+                        STATUS_OPTIONS,
+                    )
+                    priority = st.selectbox(
+                        "Priority",
+                        PRIORITY_OPTIONS,
+                        index=1,
+                    )
+
+                notes = st.text_area(
+                    "Notes",
+                    placeholder="Client details, budget, timeline etc.",
+                    height=120,
+                )
+
+                submitted = st.form_submit_button(
+                    "✅ Lead Add Karein",
+                    use_container_width=True,
+                )
+
+                if submitted:
+                    if not name.strip() or not phone.strip():
+                        st.error("Client Name aur Phone Number zaroori hain.")
+                    else:
+                        try:
+                            add_lead(
+                                name,
+                                phone,
+                                country,
+                                month,
+                                lead_source,
+                                status,
+                                priority,
+                                notes,
+                            )
+                            st.success(
+                                f"Lead '{name}' successfully add ho gayi ✅"
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Lead save nahi hui: {exc}")
+
+        else:
+            with st.form("add_referral_form", clear_on_submit=True):
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    client_name = st.text_input("Client ka Naam *")
+                    phone = st.text_input("Client ka Number *")
+                    referred_to = st.selectbox(
+                        "Kisko Refer Kar Rahe Hain *",
+                        TEAM_MEMBERS,
+                    )
+
+                with col2:
+                    referred_date = st.date_input(
+                        "Refer Karne ki Date *",
+                        value=dt.date.today(),
+                    )
+                    status = st.selectbox(
+                        "Status",
+                        STATUS_OPTIONS,
+                    )
+
+                requirement = st.text_area(
+                    "Client ki Requirement / Detail *",
+                    placeholder=(
+                        "Client ko kya chahiye, budget, timeline, "
+                        "koi khaas baat etc."
+                    ),
+                    height=140,
+                )
+
+                notes = st.text_area(
+                    "Extra Notes / Update",
+                    height=90,
+                )
+
+                submitted = st.form_submit_button(
+                    "🤝 Referral Save Karein",
+                    use_container_width=True,
+                )
+
+                if submitted:
+                    if not client_name.strip() or not phone.strip() or not requirement.strip():
+                        st.error(
+                            "Client Name, Phone Number aur Requirement zaroori hain."
+                        )
+                    else:
+                        try:
+                            add_referral(
+                                referred_date,
+                                referred_to,
+                                client_name,
+                                phone,
+                                requirement,
+                                status,
+                                notes,
+                            )
+                            st.success(
+                                f"Lead '{client_name}' successfully "
+                                f"{referred_to} ko refer ho gayi ✅"
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Referral save nahi hui: {exc}")
+
+    # ------------------------------------------------------------------
+    # TAB 2: ALL LEADS
+    # ------------------------------------------------------------------
     with tab2:
-        st.subheader("Team Sheet")
-        if st.button("🔄 Refresh Data"):
+        st.subheader("All Leads — Data Sheet")
+
+        if st.button("🔄 Refresh Leads"):
             st.rerun()
 
         df = get_all_leads()
 
         if df.empty:
-            st.info("Abhi tak koi lead add nahi hui.")
+            st.info("Data sheet mein abhi koi lead nahi mili.")
         else:
-            # ---- FILTERS ----
-            fcol1, fcol2, fcol3, fcol4 = st.columns([1.2, 1.2, 1.2, 1.6])
-            with fcol1:
-                member_filter = st.multiselect("Team Member", TEAM_MEMBERS, default=TEAM_MEMBERS)
-            with fcol2:
-                status_filter = st.multiselect("Status", STATUS_OPTIONS, default=STATUS_OPTIONS)
-            with fcol3:
-                min_date = df["referred_date"].min()
-                max_date = df["referred_date"].max()
-                date_range = st.date_input("Date Range", value=(min_date, max_date))
-            with fcol4:
-                search_term = st.text_input("🔍 Search (Naam / Number)")
+            # Filters
+            f1, f2, f3, f4 = st.columns(4)
 
-            filtered = df[
-                df["referred_to"].isin(member_filter)
-                & df["status"].isin(status_filter)
-            ]
+            with f1:
+                statuses = sorted(
+                    [x for x in df["Status"].unique() if str(x).strip()]
+                )
+                selected_status = st.multiselect(
+                    "Status",
+                    statuses,
+                    default=statuses,
+                )
 
-            if isinstance(date_range, tuple) and len(date_range) == 2:
-                start_d, end_d = date_range
+            with f2:
+                priorities = sorted(
+                    [x for x in df["Priority"].unique() if str(x).strip()]
+                )
+                if not priorities:
+                    priorities = PRIORITY_OPTIONS
+                selected_priority = st.multiselect(
+                    "Priority",
+                    priorities,
+                    default=priorities,
+                )
+
+            with f3:
+                countries = sorted(
+                    [x for x in df["Country"].unique() if str(x).strip()]
+                )
+                selected_country = st.multiselect(
+                    "Country",
+                    countries,
+                    default=countries,
+                )
+
+            with f4:
+                search = st.text_input(
+                    "🔍 Search Name / Phone / Notes"
+                )
+
+            filtered = df.copy()
+
+            if selected_status:
                 filtered = filtered[
-                    (filtered["referred_date"] >= start_d) & (filtered["referred_date"] <= end_d)
+                    filtered["Status"].isin(selected_status)
                 ]
 
-            if search_term:
-                s = search_term.lower()
+            if selected_priority:
                 filtered = filtered[
-                    filtered["client_name"].str.lower().str.contains(s)
-                    | filtered["phone_number"].str.lower().str.contains(s)
+                    filtered["Priority"].isin(selected_priority)
                 ]
 
-            st.markdown(f"**Total Leads Found: {len(filtered)}**")
+            if selected_country:
+                filtered = filtered[
+                    filtered["Country"].isin(selected_country)
+                ]
+
+            if search.strip():
+                s = search.strip().lower()
+                mask = (
+                    filtered["Name"].str.lower().str.contains(s, na=False)
+                    | filtered["Phone Number"]
+                    .str.lower()
+                    .str.contains(s, na=False)
+                    | filtered["Notes"]
+                    .str.lower()
+                    .str.contains(s, na=False)
+                )
+                filtered = filtered[mask]
+
+            st.markdown(
+                f"**Total Leads Found: {len(filtered)} / {len(df)}**"
+            )
+
+            display = filtered[
+                [
+                    "ID",
+                    "Name",
+                    "Phone Number",
+                    "Country",
+                    "Month",
+                    "Lead Source",
+                    "Status",
+                    "Priority",
+                    "Notes",
+                ]
+            ].copy()
 
             st.dataframe(
-                filtered.rename(columns={
-                    "client_name": "Client Name",
-                    "phone_number": "Phone Number",
-                    "requirement": "Requirement",
-                    "referred_to": "Referred To",
-                    "referred_date": "Date Referred",
-                    "status": "Status",
-                    "notes": "Notes",
-                    "added_by": "Added By",
-                })[["Client Name", "Phone Number", "Requirement", "Referred To",
-                    "Date Referred", "Status", "Notes", "Added By"]],
+                display,
                 use_container_width=True,
                 hide_index=True,
             )
 
             st.download_button(
-                "⬇️ Download Team Sheet (CSV)",
-                data=filtered.to_csv(index=False).encode("utf-8"),
-                file_name=f"team_sheet_{dt.date.today()}.csv",
+                "⬇️ Download Leads CSV",
+                data=filtered.drop(columns=["row_number"])
+                .to_csv(index=False)
+                .encode("utf-8"),
+                file_name=f"nm_associates_leads_{dt.date.today()}.csv",
                 mime="text/csv",
+                use_container_width=True,
+            )
+
+            # Update / delete
+            st.markdown("---")
+            st.subheader("Lead Update / Status Change / Delete")
+
+            if not filtered.empty:
+                selected_row = st.selectbox(
+                    "Lead Select Karein",
+                    filtered["row_number"].tolist(),
+                    format_func=lambda x: (
+                        f"ID {filtered.loc[filtered['row_number'] == x, 'ID'].iloc[0]} — "
+                        f"{filtered.loc[filtered['row_number'] == x, 'Name'].iloc[0]}"
+                    ),
+                )
+
+                row = filtered[
+                    filtered["row_number"] == selected_row
+                ].iloc[0]
+
+                u1, u2 = st.columns(2)
+
+                with u1:
+                    new_status = st.selectbox(
+                        "Status Update Karein",
+                        STATUS_OPTIONS,
+                        index=(
+                            STATUS_OPTIONS.index(row["Status"])
+                            if row["Status"] in STATUS_OPTIONS
+                            else 0
+                        ),
+                    )
+
+                    new_priority = st.selectbox(
+                        "Priority Update Karein",
+                        PRIORITY_OPTIONS,
+                        index=(
+                            PRIORITY_OPTIONS.index(row["Priority"])
+                            if row["Priority"] in PRIORITY_OPTIONS
+                            else 1
+                        ),
+                    )
+
+                with u2:
+                    new_notes = st.text_area(
+                        "Notes Update Karein",
+                        value=row["Notes"],
+                    )
+
+                b1, b2 = st.columns(2)
+
+                with b1:
+                    if st.button(
+                        "💾 Update Save Karein",
+                        use_container_width=True,
+                    ):
+                        try:
+                            update_lead(
+                                selected_row,
+                                {
+                                    "Status": new_status,
+                                    "Priority": new_priority,
+                                    "Notes": new_notes,
+                                },
+                            )
+                            st.success("Lead update ho gayi ✅")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Update failed: {exc}")
+
+                with b2:
+                    if st.button(
+                        "🗑️ Lead Delete Karein",
+                        use_container_width=True,
+                    ):
+                        try:
+                            delete_lead(selected_row)
+                            st.warning("Lead delete ho gayi.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Delete failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # TAB 3: TEAM REFERRALS
+    # ------------------------------------------------------------------
+    with tab3:
+        st.subheader("Team Sheet / All Referrals")
+
+        if st.button("🔄 Refresh Referrals"):
+            st.rerun()
+
+        rdf = get_all_referrals()
+
+        if rdf.empty:
+            st.info(
+                "Team Referrals sheet mein abhi koi referral record nahi mila."
+            )
+        else:
+            r1, r2, r3, r4 = st.columns(4)
+
+            with r1:
+                members = sorted(
+                    [
+                        x
+                        for x in rdf["Referred To (Team Member)"].unique()
+                        if str(x).strip()
+                    ]
+                )
+                selected_members = st.multiselect(
+                    "Team Member",
+                    members,
+                    default=members,
+                )
+
+            with r2:
+                referral_statuses = sorted(
+                    [
+                        x
+                        for x in rdf["Status"].unique()
+                        if str(x).strip()
+                    ]
+                )
+                selected_ref_status = st.multiselect(
+                    "Status",
+                    referral_statuses,
+                    default=referral_statuses,
+                )
+
+            with r3:
+                search_ref = st.text_input(
+                    "🔍 Search Client / Number"
+                )
+
+            with r4:
+                st.metric(
+                    "Total Referrals",
+                    len(rdf),
+                )
+
+            filtered_r = rdf.copy()
+
+            if selected_members:
+                filtered_r = filtered_r[
+                    filtered_r["Referred To (Team Member)"].isin(
+                        selected_members
+                    )
+                ]
+
+            if selected_ref_status:
+                filtered_r = filtered_r[
+                    filtered_r["Status"].isin(selected_ref_status)
+                ]
+
+            if search_ref.strip():
+                s = search_ref.strip().lower()
+                mask = (
+                    filtered_r["Client Name"]
+                    .str.lower()
+                    .str.contains(s, na=False)
+                    | filtered_r["Client Phone Number"]
+                    .str.lower()
+                    .str.contains(s, na=False)
+                )
+                filtered_r = filtered_r[mask]
+
+            st.markdown(
+                f"**Total Referrals Found: {len(filtered_r)} / {len(rdf)}**"
+            )
+
+            st.dataframe(
+                filtered_r[
+                    REFERRAL_HEADERS
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.download_button(
+                "⬇️ Download Team Referrals CSV",
+                data=filtered_r.drop(columns=["row_number"])
+                .to_csv(index=False)
+                .encode("utf-8"),
+                file_name=f"team_referrals_{dt.date.today()}.csv",
+                mime="text/csv",
+                use_container_width=True,
             )
 
             st.markdown("---")
-            st.subheader("Lead Update / Status Change / Delete")
-            if not filtered.empty:
-                row_numbers = filtered["row_number"].tolist()
-                selected_row = st.selectbox(
-                    "Lead Select Karein",
-                    row_numbers,
-                    format_func=lambda x: filtered.loc[filtered['row_number'] == x, 'client_name'].values[0],
+            st.subheader("Referral Status / Notes / Delete")
+
+            if not filtered_r.empty:
+                selected_ref_row = st.selectbox(
+                    "Referral Select Karein",
+                    filtered_r["row_number"].tolist(),
+                    format_func=lambda x: (
+                        f"Ref #{filtered_r.loc[filtered_r['row_number'] == x, 'Ref #'].iloc[0]} — "
+                        f"{filtered_r.loc[filtered_r['row_number'] == x, 'Client Name'].iloc[0]}"
+                    ),
                 )
-                row = filtered[filtered["row_number"] == selected_row].iloc[0]
 
-                ucol1, ucol2 = st.columns(2)
-                with ucol1:
-                    new_status = st.selectbox("Status Update Karein", STATUS_OPTIONS,
-                                               index=STATUS_OPTIONS.index(row["status"]))
-                with ucol2:
-                    new_notes = st.text_area("Notes Update Karein", value=row["notes"])
+                selected = filtered_r[
+                    filtered_r["row_number"] == selected_ref_row
+                ].iloc[0]
 
-                bcol1, bcol2 = st.columns(2)
-                with bcol1:
-                    if st.button("💾 Update Save Karein", use_container_width=True):
-                        update_lead(selected_row, status=new_status, notes=new_notes)
-                        st.success("Update ho gaya ✅")
-                        st.rerun()
-                with bcol2:
-                    if st.button("🗑️ Lead Delete Karein", use_container_width=True, type="secondary"):
-                        delete_lead(selected_row)
-                        st.warning("Lead delete ho gayi.")
-                        st.rerun()
+                c1, c2 = st.columns(2)
 
+                with c1:
+                    current_status = selected["Status"]
+                    new_ref_status = st.selectbox(
+                        "Status Update Karein",
+                        STATUS_OPTIONS,
+                        index=(
+                            STATUS_OPTIONS.index(current_status)
+                            if current_status in STATUS_OPTIONS
+                            else 0
+                        ),
+                    )
+
+                with c2:
+                    new_ref_notes = st.text_area(
+                        "Update / Notes",
+                        value=selected[
+                            "Update / Notes from Member"
+                        ],
+                    )
+
+                d1, d2 = st.columns(2)
+
+                with d1:
+                    if st.button(
+                        "💾 Referral Update Save Karein",
+                        use_container_width=True,
+                    ):
+                        try:
+                            update_referral(
+                                selected_ref_row,
+                                status=new_ref_status,
+                                notes=new_ref_notes,
+                            )
+                            st.success("Referral update ho gayi ✅")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Referral update failed: {exc}")
+
+                with d2:
+                    if st.button(
+                        "🗑️ Referral Delete Karein",
+                        use_container_width=True,
+                    ):
+                        try:
+                            delete_referral(selected_ref_row)
+                            st.warning("Referral delete ho gayi.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Referral delete failed: {exc}")
+
+
+# ----------------------------------------------------------------------
+# TEAM MEMBER VIEW
+# ----------------------------------------------------------------------
 elif role == "Admin" and not st.session_state.is_admin:
     st.title("Admin Panel")
-    st.info("Admin panel dekhne ke liye sidebar mein password enter karein.")
+    st.info(
+        "Admin panel dekhne ke liye sidebar mein password enter karein."
+    )
 
-# ========================================================================
-# TEAM MEMBER VIEW (read-only, client bhi is se update le sakta hai)
-# ========================================================================
 else:
-    st.title("📋 Team Member - Mere Leads")
+    st.title("📋 Team Member - Mere Referrals")
+
     if st.button("🔄 Refresh"):
         st.rerun()
 
-    selected_member = st.selectbox("Apna Naam Select Karein", TEAM_MEMBERS)
+    selected_member = st.selectbox(
+        "Apna Naam Select Karein",
+        TEAM_MEMBERS,
+    )
 
-    df = get_all_leads()
-    my_leads = df[df["referred_to"] == selected_member] if not df.empty else df
+    rdf = get_all_referrals()
 
-    st.markdown(f"### {selected_member} ke paas total **{len(my_leads)}** leads hain")
-
-    if my_leads.empty:
-        st.info("Abhi tak koi lead assign nahi hui.")
+    if rdf.empty:
+        st.info("Abhi tak koi referral assign nahi hui.")
     else:
-        status_filter = st.multiselect("Status ke hisaab se dekhein", STATUS_OPTIONS, default=STATUS_OPTIONS)
-        my_leads = my_leads[my_leads["status"].isin(status_filter)]
+        my_referrals = rdf[
+            rdf["Referred To (Team Member)"] == selected_member
+        ].copy()
 
-        for _, row in my_leads.iterrows():
-            with st.expander(f"📌 {row['client_name']} — {row['referred_date']} — {row['status']}"):
-                st.write(f"**Phone Number:** {row['phone_number']}")
-                st.write(f"**Requirement:** {row['requirement']}")
-                st.write(f"**Notes:** {row['notes'] if row['notes'] else '—'}")
-                st.write(f"**Added By:** {row['added_by']}")
+        st.markdown(
+            f"### {selected_member} ke paas total "
+            f"**{len(my_referrals)}** referrals hain"
+        )
+
+        if my_referrals.empty:
+            st.info(
+                f"Abhi tak {selected_member} ko koi referral assign nahi hui."
+            )
+        else:
+            status_filter = st.multiselect(
+                "Status ke hisaab se dekhein",
+                STATUS_OPTIONS,
+                default=STATUS_OPTIONS,
+            )
+
+            my_referrals = my_referrals[
+                my_referrals["Status"].isin(status_filter)
+            ]
+
+            for _, row in my_referrals.iterrows():
+                with st.expander(
+                    f"📌 {row['Client Name']} — "
+                    f"{row['Date Referred']} — {row['Status']}"
+                ):
+                    st.write(
+                        f"**Phone Number:** {row['Client Phone Number']}"
+                    )
+                    st.write(
+                        f"**Requirement:** "
+                        f"{row['Client Requirement / Details']}"
+                    )
+                    st.write(
+                        f"**Last Update:** "
+                        f"{row['Last Update Date'] or '—'}"
+                    )
+                    st.write(
+                        f"**Notes:** "
+                        f"{row['Update / Notes from Member'] or '—'}"
+                    )
